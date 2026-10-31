@@ -1,0 +1,448 @@
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -1476,6 +1476,18 @@
+ 	{
+ 		.class = PCI_CLASS_SYSTEM_OTHER << 8, .class_mask = ~0,
+ 		.vendor = PCI_VENDOR_ID_INTEL,
++		.device = PCI_DEVICE_ID_INTEL_REDWOOD_RIDGE_2C_NHI,
++		.subvendor = PCI_ANY_ID, .subdevice = PCI_ANY_ID,
++	},
++	{
++		.class = PCI_CLASS_SYSTEM_OTHER << 8, .class_mask = ~0,
++		.vendor = PCI_VENDOR_ID_INTEL,
++		.device = PCI_DEVICE_ID_INTEL_REDWOOD_RIDGE_4C_NHI,
++		.subvendor = PCI_ANY_ID, .subdevice = PCI_ANY_ID,
++	},
++	{
++		.class = PCI_CLASS_SYSTEM_OTHER << 8, .class_mask = ~0,
++		.vendor = PCI_VENDOR_ID_INTEL,
+ 		.device = PCI_DEVICE_ID_INTEL_FALCON_RIDGE_2C_NHI,
+ 		.subvendor = PCI_ANY_ID, .subdevice = PCI_ANY_ID,
+ 	},
+--- a/drivers/thunderbolt/icm.c
++++ b/drivers/thunderbolt/icm.c
+@@ -18,6 +18,8 @@
+ #include <linux/sizes.h>
+ #include <linux/slab.h>
+ #include <linux/workqueue.h>
++#include <linux/uuid.h>
++#include <linux/string.h>
+ 
+ #include "ctl.h"
+ #include "nhi_regs.h"
+@@ -96,6 +98,11 @@
+ 	struct pci_dev *upstream_port;
+ 	int vnd_cap;
+ 	bool safe_mode;
++	bool rr_placeholder_root;
++	struct list_head rr_devices;
++	struct mutex rr_lock;
++	int rr_policy;
++	bool rr_sysfs;
+ 	size_t max_boot_acl;
+ 	bool rpm;
+ 	bool can_upgrade_nvm;
+@@ -716,6 +723,284 @@
+ 	tb_xdomain_remove(xd);
+ }
+ 
++
++/*
++ * Redwood Ridge (DSL4410/DSL4510) support.
++ *
++ * On these controllers the firmware does not expose the host router config
++ * space to the OS, so the normal switch enumeration cannot work. Instead a
++ * placeholder root switch is used and devices announced by the firmware
++ * are tracked in a simple list exposed via sysfs on the domain:
++ *
++ *   rr_devices  - one line per device: uuid link.depth state presence name
++ *   rr_policy   - "auto" (approve every device) or "manual"
++ *   rr_approve  - write a device uuid to approve it (creates PCIe tunnel)
++ *
++ * Changes are signalled with a KOBJ_CHANGE uevent carrying RR_DEVICE=<uuid>
++ * and RR_STATE=<pending|authorized|disconnected>.
++ */
++enum { RR_POLICY_AUTO = 0, RR_POLICY_MANUAL = 1 };
++
++static char *rr_policy_param = "auto";
++module_param_named(rr_policy, rr_policy_param, charp, 0444);
++MODULE_PARM_DESC(rr_policy,
++		 "Redwood Ridge device approval policy: auto (default) or manual");
++
++struct rr_device {
++	struct list_head list;
++	uuid_t uuid;
++	char name[64];
++	u8 link;
++	u8 depth;
++	u8 conn_id;
++	u8 conn_key;
++	u16 flags;
++	bool authorized;
++	bool present;
++};
++
++static void icm_rr_uevent(struct tb *tb, const struct rr_device *d,
++			  const char *state)
++{
++	char uuid_env[48], state_env[32];
++	char *envp[] = { uuid_env, state_env, NULL };
++
++	snprintf(uuid_env, sizeof(uuid_env), "RR_DEVICE=%pUb", &d->uuid);
++	snprintf(state_env, sizeof(state_env), "RR_STATE=%s", state);
++	kobject_uevent_env(&tb->dev.kobj, KOBJ_CHANGE, envp);
++}
++
++/* Must be called with icm->rr_lock held */
++static struct rr_device *icm_rr_find(struct icm *icm, const uuid_t *uuid)
++{
++	struct rr_device *d;
++
++	list_for_each_entry(d, &icm->rr_devices, list)
++		if (uuid_equal(&d->uuid, uuid))
++			return d;
++	return NULL;
++}
++
++/* Must be called with tb->lock held */
++static int icm_rr_send_approve(struct tb *tb, struct rr_device *d)
++{
++	struct icm_fr_pkg_approve_device request;
++	struct icm_fr_pkg_approve_device reply;
++	int ret;
++
++	memset(&request, 0, sizeof(request));
++	memcpy(&request.ep_uuid, &d->uuid, sizeof(request.ep_uuid));
++	request.hdr.code = ICM_APPROVE_DEVICE;
++	request.connection_id = d->conn_id;
++	request.connection_key = d->conn_key;
++
++	memset(&reply, 0, sizeof(reply));
++	ret = icm_request(tb, &request, sizeof(request), &reply, sizeof(reply),
++			  1, ICM_RETRIES, ICM_APPROVE_TIMEOUT);
++	if (ret) {
++		tb_warn(tb, "RR: approve request for %pUb failed: %d\n",
++			&d->uuid, ret);
++		return ret;
++	}
++	if (reply.hdr.flags & ICM_FLAGS_ERROR) {
++		tb_warn(tb, "RR: PCIe tunnel creation for %pUb failed (flags %#x)\n",
++			&d->uuid, reply.hdr.flags);
++		return -EIO;
++	}
++
++	d->authorized = true;
++	tb_info(tb, "RR: device %pUb (%s) approved, PCIe tunnel requested\n",
++		&d->uuid, d->name);
++	return 0;
++}
++
++static void icm_rr_copy_name(struct rr_device *d, const u32 *ep_name,
++			     size_t size)
++{
++	const char *src = (const char *)ep_name;
++	size_t i = 0, n = 0;
++
++	/* Skip the Intel VSS length/type prefix bytes */
++	while (i < size && (src[i] < 0x20 || src[i] > 0x7e))
++		i++;
++	while (i < size && n < sizeof(d->name) - 1 &&
++	       src[i] >= 0x20 && src[i] <= 0x7e)
++		d->name[n++] = src[i++];
++	d->name[n] = '\0';
++	if (!n)
++		strscpy(d->name, "unknown", sizeof(d->name));
++}
++
++/* Called with tb->lock held */
++static void icm_rr_device_connected(struct tb *tb,
++		const struct icm_fr_event_device_connected *pkg,
++		u8 link, u8 depth, bool authorized)
++{
++	struct icm *icm = tb_priv(tb);
++	struct rr_device *d;
++	bool is_new = false;
++
++	mutex_lock(&icm->rr_lock);
++	d = icm_rr_find(icm, &pkg->ep_uuid);
++	if (!d) {
++		d = kzalloc(sizeof(*d), GFP_KERNEL);
++		if (!d) {
++			mutex_unlock(&icm->rr_lock);
++			return;
++		}
++		uuid_copy(&d->uuid, &pkg->ep_uuid);
++		list_add_tail(&d->list, &icm->rr_devices);
++		is_new = true;
++	}
++	d->link = link;
++	d->depth = depth;
++	d->conn_id = pkg->connection_id;
++	d->conn_key = pkg->connection_key;
++	d->flags = pkg->hdr.flags;
++	d->present = true;
++	d->authorized = authorized;
++	icm_rr_copy_name(d, pkg->ep_name, sizeof(pkg->ep_name));
++
++	tb_info(tb, "RR: device %pUb \"%s\" at %u.%u %s (conn_id=%u key=%u flags=%#x)%s\n",
++		&d->uuid, d->name, link, depth,
++		authorized ? "already authorized" : "pending",
++		d->conn_id, d->conn_key, d->flags, is_new ? "" : " [update]");
++
++	if (!d->authorized && icm->rr_policy == RR_POLICY_AUTO)
++		icm_rr_send_approve(tb, d);
++
++	icm_rr_uevent(tb, d, d->authorized ? "authorized" : "pending");
++	mutex_unlock(&icm->rr_lock);
++}
++
++/* Called with tb->lock held */
++static void icm_rr_device_disconnected(struct tb *tb, u8 link, u8 depth)
++{
++	struct icm *icm = tb_priv(tb);
++	struct rr_device *d;
++
++	mutex_lock(&icm->rr_lock);
++	list_for_each_entry(d, &icm->rr_devices, list) {
++		if (d->present && d->link == link && d->depth == depth) {
++			d->present = false;
++			d->authorized = false;
++			tb_info(tb, "RR: device %pUb \"%s\" at %u.%u disconnected\n",
++				&d->uuid, d->name, link, depth);
++			icm_rr_uevent(tb, d, "disconnected");
++		}
++	}
++	mutex_unlock(&icm->rr_lock);
++}
++
++static ssize_t rr_devices_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	struct tb *tb = container_of(dev, struct tb, dev);
++	struct icm *icm = tb_priv(tb);
++	struct rr_device *d;
++	ssize_t len = 0;
++
++	mutex_lock(&icm->rr_lock);
++	list_for_each_entry(d, &icm->rr_devices, list) {
++		len += sysfs_emit_at(buf, len, "%pUb %u.%u %s %s %s\n",
++				     &d->uuid, d->link, d->depth,
++				     d->authorized ? "authorized" : "pending",
++				     d->present ? "present" : "absent",
++				     d->name);
++	}
++	mutex_unlock(&icm->rr_lock);
++	return len;
++}
++static DEVICE_ATTR_RO(rr_devices);
++
++static ssize_t rr_policy_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct tb *tb = container_of(dev, struct tb, dev);
++	struct icm *icm = tb_priv(tb);
++
++	return sysfs_emit(buf, "%s\n",
++			  icm->rr_policy == RR_POLICY_MANUAL ? "manual" : "auto");
++}
++
++static ssize_t rr_policy_store(struct device *dev,
++			       struct device_attribute *attr,
++			       const char *buf, size_t count)
++{
++	struct tb *tb = container_of(dev, struct tb, dev);
++	struct icm *icm = tb_priv(tb);
++
++	if (sysfs_streq(buf, "auto"))
++		icm->rr_policy = RR_POLICY_AUTO;
++	else if (sysfs_streq(buf, "manual"))
++		icm->rr_policy = RR_POLICY_MANUAL;
++	else
++		return -EINVAL;
++	return count;
++}
++static DEVICE_ATTR_RW(rr_policy);
++
++static ssize_t rr_approve_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	struct tb *tb = container_of(dev, struct tb, dev);
++	struct icm *icm = tb_priv(tb);
++	struct rr_device *d;
++	char tmp[UUID_STRING_LEN + 1];
++	uuid_t uuid;
++	int ret;
++
++	strscpy(tmp, buf, sizeof(tmp));
++	strim(tmp);
++	if (uuid_parse(tmp, &uuid))
++		return -EINVAL;
++
++	if (mutex_lock_interruptible(&tb->lock))
++		return -ERESTARTSYS;
++	mutex_lock(&icm->rr_lock);
++	d = icm_rr_find(icm, &uuid);
++	if (!d) {
++		ret = -ENOENT;
++	} else if (!d->present) {
++		ret = -ENODEV;
++	} else if (d->authorized) {
++		ret = 0;
++	} else {
++		ret = icm_rr_send_approve(tb, d);
++		if (!ret)
++			icm_rr_uevent(tb, d, "authorized");
++	}
++	mutex_unlock(&icm->rr_lock);
++	mutex_unlock(&tb->lock);
++
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(rr_approve);
++
++static struct attribute *rr_attrs[] = {
++	&dev_attr_rr_devices.attr,
++	&dev_attr_rr_policy.attr,
++	&dev_attr_rr_approve.attr,
++	NULL,
++};
++
++static const struct attribute_group rr_attr_group = {
++	.attrs = rr_attrs,
++};
++
++static void icm_rr_free_devices(struct icm *icm)
++{
++	struct rr_device *d, *tmp;
++
++	mutex_lock(&icm->rr_lock);
++	list_for_each_entry_safe(d, tmp, &icm->rr_devices, list) {
++		list_del(&d->list);
++		kfree(d);
++	}
++	mutex_unlock(&icm->rr_lock);
++}
++
+ static void
+ icm_fr_device_connected(struct tb *tb, const struct icm_pkg_header *hdr)
+ {
+@@ -749,6 +1034,11 @@
+ 		return;
+ 	}
+ 
++	if (icm->rr_placeholder_root) {
++		icm_rr_device_connected(tb, pkg, link, depth, authorized);
++		return;
++	}
++
+ 	sw = tb_switch_find_by_uuid(tb, &pkg->ep_uuid);
+ 	if (sw) {
+ 		u8 phy_port, sw_phy_port;
+@@ -881,6 +1171,11 @@
+ 		return;
+ 	}
+ 
++	if (((struct icm *)tb_priv(tb))->rr_placeholder_root) {
++		icm_rr_device_disconnected(tb, link, depth);
++		return;
++	}
++
+ 	sw = tb_switch_find_by_link_depth(tb, link, depth);
+ 	if (!sw) {
+ 		tb_warn(tb, "no switch exists at %u.%u, ignoring\n", link,
+@@ -919,6 +1214,11 @@
+ 
+ 	route = get_route(pkg->local_route_hi, pkg->local_route_lo);
+ 
++	if (((struct icm *)tb_priv(tb))->rr_placeholder_root) {
++		tb_info(tb, "RR: ignoring xdomain at %u.%u\n", link, depth);
++		return;
++	}
++
+ 	xd = tb_xdomain_find_by_uuid(tb, &pkg->remote_uuid);
+ 	if (xd) {
+ 		u8 xd_phy_port, phy_port;
+@@ -2149,14 +2449,20 @@
+ 	struct icm *icm = tb_priv(tb);
+ 	int ret;
+ 
+-	if (icm->safe_mode)
++	if (icm->safe_mode || icm->rr_placeholder_root)
+ 		tb->root_switch = tb_switch_alloc_safe_mode(tb, &tb->dev, 0);
+ 	else
+ 		tb->root_switch = tb_switch_alloc(tb, &tb->dev, 0);
++	if (IS_ERR(tb->root_switch) && !icm->safe_mode) {
++		tb_warn(tb, "RR: host router config space unreadable (%ld), using placeholder root switch\n",
++			PTR_ERR(tb->root_switch));
++		tb->root_switch = tb_switch_alloc_safe_mode(tb, &tb->dev, 0);
++		icm->rr_placeholder_root = true;
++	}
+ 	if (IS_ERR(tb->root_switch))
+ 		return PTR_ERR(tb->root_switch);
+ 
+-	tb->root_switch->no_nvm_upgrade = !icm->can_upgrade_nvm;
++	tb->root_switch->no_nvm_upgrade = !icm->can_upgrade_nvm || icm->rr_placeholder_root;
+ 	tb->root_switch->rpm = icm->rpm;
+ 
+ 	if (icm->set_uuid)
+@@ -2166,9 +2472,17 @@
+ 	if (ret) {
+ 		tb_switch_put(tb->root_switch);
+ 		tb->root_switch = NULL;
++		return ret;
+ 	}
+ 
+-	return ret;
++	if (icm->rr_placeholder_root) {
++		if (sysfs_create_group(&tb->dev.kobj, &rr_attr_group))
++			tb_warn(tb, "RR: failed to create sysfs attributes\n");
++		else
++			icm->rr_sysfs = true;
++	}
++
++	return 0;
+ }
+ 
+ static void icm_stop(struct tb *tb)
+@@ -2176,6 +2490,11 @@
+ 	struct icm *icm = tb_priv(tb);
+ 
+ 	cancel_delayed_work(&icm->rescan_work);
++	if (icm->rr_sysfs) {
++		sysfs_remove_group(&tb->dev.kobj, &rr_attr_group);
++		icm->rr_sysfs = false;
++	}
++	icm_rr_free_devices(icm);
+ 	tb_switch_remove(tb->root_switch);
+ 	tb->root_switch = NULL;
+ 	nhi_mailbox_cmd(tb->nhi, NHI_MAILBOX_DRV_UNLOADS, 0);
+@@ -2438,8 +2757,28 @@
+ 	icm = tb_priv(tb);
+ 	INIT_DELAYED_WORK(&icm->rescan_work, icm_rescan_work);
+ 	mutex_init(&icm->request_lock);
++	INIT_LIST_HEAD(&icm->rr_devices);
++	mutex_init(&icm->rr_lock);
++	icm->rr_policy = (rr_policy_param && sysfs_streq(rr_policy_param, "manual")) ?
++			 RR_POLICY_MANUAL : RR_POLICY_AUTO;
+ 
+ 	switch (nhi->pdev->device) {
++	case PCI_DEVICE_ID_INTEL_REDWOOD_RIDGE_2C_NHI:
++	case PCI_DEVICE_ID_INTEL_REDWOOD_RIDGE_4C_NHI:
++		/* Host router config space is not readable on this firmware */
++		icm->rr_placeholder_root = true;
++		icm->can_upgrade_nvm = false;
++		icm->is_supported = icm_fr_is_supported;
++		icm->get_route = icm_fr_get_route;
++		icm->save_devices = icm_fr_save_devices;
++		icm->driver_ready = icm_fr_driver_ready;
++		icm->device_connected = icm_fr_device_connected;
++		icm->device_disconnected = icm_fr_device_disconnected;
++		icm->xdomain_connected = icm_fr_xdomain_connected;
++		icm->xdomain_disconnected = icm_fr_xdomain_disconnected;
++		tb->cm_ops = &icm_fr_ops;
++		break;
++
+ 	case PCI_DEVICE_ID_INTEL_FALCON_RIDGE_2C_NHI:
+ 	case PCI_DEVICE_ID_INTEL_FALCON_RIDGE_4C_NHI:
+ 		icm->can_upgrade_nvm = true;

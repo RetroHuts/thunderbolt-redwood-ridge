@@ -1,0 +1,22 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck
+      - run: shellcheck install.sh uninstall.sh tools/tbt-slot-off.sh
+      - run: python3 -m py_compile tools/tbt-rr
+      - run: bash -n install.sh uninstall.sh
+  build-module:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q build-essential linux-headers-generic
+      - name: build against installed generic headers
+        run: |
+          KDIR=$(ls -d /usr/src/linux-headers-*-generic | sort -V | tail -1)
+          echo "building against $KDIR"
+          make -C "$KDIR" M="$PWD/src" CONFIG_USB4=m CONFIG_ACPI=y CONFIG_DEBUG_FS=y modules
+          modinfo src/thunderbolt.ko | grep -E 'alias:.*1566|parm:.*rr_policy'

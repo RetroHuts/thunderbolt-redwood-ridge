@@ -1,0 +1,3 @@
+# Approve allowlisted devices automatically when the Redwood Ridge driver
+# reports a pending device (manual policy).
+ACTION=="change", SUBSYSTEM=="thunderbolt", ENV{RR_STATE}=="pending", RUN+="/usr/local/bin/tbt-rr apply --uuid $env{RR_DEVICE}"

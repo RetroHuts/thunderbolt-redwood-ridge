@@ -1,0 +1,11 @@
+[Unit]
+Description=Approve allowlisted Thunderbolt devices (Redwood Ridge)
+After=systemd-udev-settle.service
+ConditionPathExistsGlob=/sys/bus/thunderbolt/devices/domain*/rr_devices
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tbt-rr apply
+
+[Install]
+WantedBy=multi-user.target

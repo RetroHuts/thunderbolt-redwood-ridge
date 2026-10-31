@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""tbt-rr - view and authorize Thunderbolt devices on Intel Redwood Ridge hosts.
+
+Works together with the patched `thunderbolt` kernel module from the
+thunderbolt-redwood-ridge project, which exposes per-domain sysfs attributes:
+  rr_devices, rr_policy, rr_approve
+"""
+import argparse, glob, os, shutil, subprocess, sys, time
+
+SYSFS_GLOB = "/sys/bus/thunderbolt/devices/domain*/rr_devices"
+CONF_DIR = "/etc/thunderbolt-rr"
+ALLOWLIST = os.path.join(CONF_DIR, "allowlist")
+MODPROBE_CONF = "/etc/modprobe.d/thunderbolt-rr.conf"
+
+
+class Device:
+    __slots__ = ("domain", "uuid", "link", "depth", "state", "presence", "name")
+
+    def __init__(self, domain, line):
+        parts = line.split(None, 4)
+        self.domain = domain
+        self.uuid, pos, self.state, self.presence = parts[0], parts[1], parts[2], parts[3]
+        self.name = parts[4] if len(parts) > 4 else ""
+        self.link, self.depth = pos.split(".")
+
+    @property
+    def pending(self):
+        return self.state == "pending" and self.presence == "present"
+
+
+def domains():
+    return sorted(os.path.dirname(p) for p in glob.glob(SYSFS_GLOB))
+
+
+def read(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+def write(path, value):
+    with open(path, "w") as f:
+        f.write(value + "\n")
+
+
+def devices():
+    out = []
+    for d in domains():
+        for line in read(os.path.join(d, "rr_devices")).splitlines():
+            if line.strip():
+                out.append(Device(d, line))
+    return out
+
+
+def require_driver():
+    if not domains():
+        sys.exit("tbt-rr: no Redwood Ridge domain found. Is the patched "
+                 "thunderbolt module loaded? (see /sys/bus/thunderbolt/devices)")
+
+
+def load_allowlist():
+    try:
+        with open(ALLOWLIST) as f:
+            return {l.split("#", 1)[0].strip().lower() for l in f if l.split("#", 1)[0].strip()}
+    except FileNotFoundError:
+        return set()
+
+
+def save_allowlist(entries):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    with open(ALLOWLIST, "w") as f:
+        f.write("# Thunderbolt device UUIDs approved automatically by tbt-rr\n")
+        for e in sorted(entries):
+            f.write(e + "\n")
+
+
+def resolve(devs, ref):
+    """Resolve a device by index (1-based), full uuid or unique uuid prefix."""
+    if ref.isdigit():
+        i = int(ref) - 1
+        if 0 <= i < len(devs):
+            return devs[i]
+        sys.exit(f"tbt-rr: no device #{ref}")
+    m = [d for d in devs if d.uuid.lower().startswith(ref.lower())]
+    if len(m) == 1:
+        return m[0]
+    sys.exit(f"tbt-rr: {'ambiguous' if m else 'unknown'} device '{ref}'")
+
+
+def approve(dev):
+    write(os.path.join(dev.domain, "rr_approve"), dev.uuid)
+
+
+def cmd_list(args):
+    require_driver()
+    devs = devices()
+    allow = load_allowlist()
+    for d in domains():
+        print(f"{os.path.basename(d)}: policy={read(os.path.join(d, 'rr_policy'))}")
+    if not devs:
+        print("no devices seen yet")
+        return
+    print(f"{'#':>2} {'UUID':36} {'POS':4} {'STATE':10} {'PRESENCE':8} {'ALLOW':5} NAME")
+    for i, d in enumerate(devs, 1):
+        print(f"{i:>2} {d.uuid:36} {d.link}.{d.depth:<2} {d.state:10} {d.presence:8} "
+              f"{'yes' if d.uuid.lower() in allow else 'no':5} {d.name}")
+
+
+def cmd_approve(args):
+    require_driver()
+    devs = devices()
+    d = resolve(devs, args.device)
+    if not d.pending and d.state == "authorized":
+        print(f"{d.uuid} already authorized")
+    else:
+        approve(d)
+        print(f"approved {d.uuid} ({d.name})")
+    if args.remember:
+        a = load_allowlist(); a.add(d.uuid.lower()); save_allowlist(a)
+        print(f"added to {ALLOWLIST}")
+
+
+def cmd_policy(args):
+    require_driver()
+    if args.mode:
+        for d in domains():
+            write(os.path.join(d, "rr_policy"), args.mode)
+        if args.persist:
+            os.makedirs(os.path.dirname(MODPROBE_CONF), exist_ok=True)
+            with open(MODPROBE_CONF, "w") as f:
+                f.write("# written by tbt-rr\noptions thunderbolt rr_policy=%s\n" % args.mode)
+            print(f"persisted in {MODPROBE_CONF}")
+    for d in domains():
+        print(f"{os.path.basename(d)}: {read(os.path.join(d, 'rr_policy'))}")
+
+
+def cmd_allow(args):
+    a = load_allowlist()
+    if args.remove:
+        a.discard(args.uuid.lower())
+    else:
+        a.add(args.uuid.lower())
+    save_allowlist(a)
+    cmd_allowed(args)
+
+
+def cmd_allowed(args):
+    for u in sorted(load_allowlist()):
+        print(u)
+
+
+def cmd_apply(args):
+    """Approve pending devices that are in the allowlist (udev / boot hook)."""
+    require_driver()
+    allow = load_allowlist()
+    n = 0
+    for d in devices():
+        if d.pending and d.uuid.lower() in allow and (not args.uuid or d.uuid.lower() == args.uuid.lower()):
+            approve(d); n += 1
+            print(f"approved {d.uuid} ({d.name})")
+    if not n and args.uuid:
+        print(f"{args.uuid}: not pending or not in allowlist")
+
+
+def zenity(*a):
+    return subprocess.run(["zenity", *a], capture_output=True, text=True)
+
+
+def cmd_monitor(args):
+    require_driver()
+    seen = {}
+    gui = args.prompt and shutil.which("zenity") and os.environ.get("DISPLAY")
+    print("monitoring (Ctrl-C to stop)")
+    while True:
+        for d in devices():
+            key = (d.uuid, d.state, d.presence)
+            if seen.get(d.uuid) == key:
+                continue
+            seen[d.uuid] = key
+            print(time.strftime("%H:%M:%S"), d.uuid, f"{d.link}.{d.depth}", d.state, d.presence, d.name)
+            if d.pending and args.prompt:
+                if gui:
+                    r = zenity("--question", "--title=Thunderbolt device",
+                               f"--text=Allow Thunderbolt device\n\n{d.name}\n{d.uuid}\n\nto connect (creates a PCIe tunnel)?",
+                               "--ok-label=Allow once", "--cancel-label=Deny",
+                               "--extra-button=Always allow")
+                    choice = "always" if r.stdout.strip() == "Always allow" else ("once" if r.returncode == 0 else "deny")
+                else:
+                    ans = input(f"allow {d.name} {d.uuid}? [o]nce/[a]lways/[N] ").strip().lower()
+                    choice = {"o": "once", "a": "always"}.get(ans[:1], "deny")
+                if choice in ("once", "always"):
+                    approve(d)
+                    if choice == "always":
+                        a = load_allowlist(); a.add(d.uuid.lower()); save_allowlist(a)
+        time.sleep(args.interval)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="tbt-rr", description=__doc__.splitlines()[0])
+    sp = p.add_subparsers(dest="cmd", required=True)
+    sp.add_parser("list", help="show devices and policy").set_defaults(f=cmd_list)
+    a = sp.add_parser("approve", help="approve a device (index, uuid or uuid prefix)")
+    a.add_argument("device"); a.add_argument("-r", "--remember", action="store_true", help="also add to allowlist")
+    a.set_defaults(f=cmd_approve)
+    a = sp.add_parser("policy", help="show or set approval policy (auto|manual)")
+    a.add_argument("mode", nargs="?", choices=["auto", "manual"]); a.add_argument("--persist", action="store_true")
+    a.set_defaults(f=cmd_policy)
+    a = sp.add_parser("allow", help="add (or --remove) a uuid in the allowlist")
+    a.add_argument("uuid"); a.add_argument("--remove", action="store_true"); a.set_defaults(f=cmd_allow)
+    sp.add_parser("allowed", help="print the allowlist").set_defaults(f=cmd_allowed)
+    a = sp.add_parser("apply", help="approve pending allowlisted devices (used by udev/systemd)")
+    a.add_argument("--uuid"); a.set_defaults(f=cmd_apply)
+    a = sp.add_parser("monitor", help="watch device events; --prompt asks before approving")
+    a.add_argument("--prompt", action="store_true"); a.add_argument("--interval", type=float, default=1.0)
+    a.set_defaults(f=cmd_monitor)
+    args = p.parse_args()
+    try:
+        args.f(args)
+    except PermissionError as e:
+        sys.exit(f"tbt-rr: permission denied ({e.filename}); run as root")
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
